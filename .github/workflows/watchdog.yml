@@ -1,0 +1,138 @@
+# Watches the watcher: every 5 minutes, asks ops-watch (a Cloudflare Worker) when its last
+# scheduled run finished, and texts Morris through Twilio if it is unreachable or more than
+# 10 minutes old. One text when it goes stale, a reminder at most once an hour while it stays
+# stale, one text when it is back. Runs on GitHub, off Cloudflare, so it keeps working when
+# Cloudflare doesn't.
+name: watchdog
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      test_text:
+        description: "Send one test text, whatever the heartbeat says"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: write # re-enable this workflow so GitHub's 60-day inactivity rule never turns it off
+
+concurrency:
+  group: watchdog
+  cancel-in-progress: false
+
+env:
+  STALE_AFTER_S: 600
+  REMIND_EVERY_S: 3600
+  KEEPALIVE_EVERY_S: 86400
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Restore alert state
+        uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: watchdog-state-${{ github.run_id }}
+          restore-keys: watchdog-state-
+
+      - name: Check the heartbeat
+        env:
+          HEARTBEAT_URL: ${{ vars.HEARTBEAT_URL }}
+          TWILIO_SID: ${{ secrets.TWILIO_SID }}
+          TWILIO_TOKEN: ${{ secrets.TWILIO_TOKEN }}
+          TWILIO_FROM: ${{ secrets.TWILIO_FROM }}
+          ALERT_PHONE: ${{ secrets.ALERT_PHONE }}
+          TEST_TEXT: ${{ github.event_name == 'workflow_dispatch' && inputs.test_text }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          mkdir -p state
+          [ -s state/state.json ] || echo '{}' > state/state.json
+          now=$(date +%s)
+          get() { jq -r ".$1 // empty" state/state.json; }
+          put() { jq "$1" state/state.json > state/new.json && mv state/new.json state/state.json; }
+          et() { TZ=America/New_York date -d "@$1" '+%-I:%M %p ET'; }
+
+          # Texts through Twilio. Prints only the HTTP status, never the numbers.
+          text() {
+            code=$(curl -sS -o state/twilio.json -w '%{http_code}' --max-time 20 \
+              -u "$TWILIO_SID:$TWILIO_TOKEN" \
+              "https://api.twilio.com/2010-04-01/Accounts/$TWILIO_SID/Messages.json" \
+              --data-urlencode "To=$ALERT_PHONE" --data-urlencode "From=$TWILIO_FROM" \
+              --data-urlencode "Body=$1")
+            rm -f state/twilio.json
+            echo "Twilio answered HTTP $code"
+            [ "${code:0:1}" = 2 ]
+          }
+
+          # 3 tries, 10 s apart, 10 s timeout each.
+          body=""
+          for try in 1 2 3; do
+            body=$(curl -sS --fail --max-time 10 -H 'cache-control: no-cache' "$HEARTBEAT_URL") && break
+            body=""
+            [ "$try" -lt 3 ] && sleep 10
+          done
+          age=$(echo "$body" | jq -r '.age_s // empty' 2>/dev/null)
+          last=$(echo "$body" | jq -r '.last_run // empty' 2>/dev/null)
+          [ -n "$last" ] && put ".last_run = $(date -d "$last" +%s)"
+          last_s=$(get last_run)
+          last_words=${last_s:+$(et "$last_s")}
+
+          if [ -n "$age" ] && [ "$age" -le "$STALE_AFTER_S" ]; then
+            echo "Fresh: last run $last ($age s ago)"; stale=0
+          else
+            echo "STALE: ${age:+last run $age s ago}${age:-heartbeat unreachable or empty}"; stale=1
+          fi
+
+          failed=0
+          if [ "$stale" = 1 ]; then
+            if [ -n "$last_s" ]; then mins=$(( (now - last_s) / 60 )); else mins="?"; fi
+            msg="ops-watch has not run for $mins min (last run ${last_words:-unknown}). Your outage alerts are OFF until it is fixed. Check Cloudflare Workers > ops-watch."
+            [ -z "$age" ] && msg="ops-watch is not answering its heartbeat (last run ${last_words:-unknown}, $mins min ago). Your outage alerts may be OFF. Check Cloudflare Workers > ops-watch."
+            told=$(get told)
+            if [ -z "$told" ] || [ $(( now - told )) -ge "$REMIND_EVERY_S" ]; then
+              [ -n "$told" ] && msg="Still down: $msg"
+              if text "$msg"; then put ".told = $now | .stale_since = (.stale_since // $now)"; else failed=1; fi
+            else
+              echo "Already texted $(( (now - told) / 60 )) min ago; next reminder after an hour."
+            fi
+          elif [ -n "$(get stale_since)" ]; then
+            since=$(get stale_since)
+            if [ -n "$(get told)" ]; then
+              if text "ops-watch is back (last run $last_words). Outage alerts are on again. It was stale for about $(( (now - since) / 60 )) min."; then
+                put 'del(.told, .stale_since)'; else failed=1; fi
+            else
+              put 'del(.stale_since)'
+            fi
+          fi
+
+          if [ "$TEST_TEXT" = true ]; then
+            status="fresh, last run $last_words"; [ "$stale" = 1 ] && status="STALE"
+            text "TEST from ops-watchdog (GitHub Actions): this is only a test. ops-watch is $status. Real alerts will look like this." || failed=1
+          fi
+
+          # Keepalive: GitHub turns off scheduled workflows after 60 days without repo activity.
+          # Enabling it again (a no-op while it is on) once a day keeps it on.
+          kept=$(get kept_alive)
+          if [ -z "$kept" ] || [ $(( now - kept )) -ge "$KEEPALIVE_EVERY_S" ]; then
+            if gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/watchdog.yml/enable" --silent; then
+              echo "Keepalive: workflow enabled"; put ".kept_alive = $now"
+            else
+              echo "::warning::Keepalive call failed"
+            fi
+          fi
+
+          echo "State: $(jq -c 'del(.last_run)' state/state.json)"
+          [ "$failed" = 0 ] || { echo "::error::A text could not be sent"; exit 1; }
+
+      - name: Save alert state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state
+          key: watchdog-state-${{ github.run_id }}-${{ github.run_attempt }}
