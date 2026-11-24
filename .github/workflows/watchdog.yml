@@ -8,10 +8,15 @@ name: watchdog
 on:
   schedule:
     - cron: "*/5 * * * *"
+    - cron: "0 14 * * 1" # weekly "still alive" text, Monday 9 AM ET (EST; 10 AM during EDT)
   workflow_dispatch:
     inputs:
       test_text:
         description: "Send one test text, whatever the heartbeat says"
+        type: boolean
+        default: false
+      weekly:
+        description: "Send the weekly still-alive text now (skipped if the heartbeat is stale)"
         type: boolean
         default: false
 
@@ -48,6 +53,7 @@ jobs:
           TWILIO_FROM: ${{ secrets.TWILIO_FROM }}
           ALERT_PHONE: ${{ secrets.ALERT_PHONE }}
           TEST_TEXT: ${{ github.event_name == 'workflow_dispatch' && inputs.test_text }}
+          WEEKLY: ${{ github.event.schedule == '0 14 * * 1' || (github.event_name == 'workflow_dispatch' && inputs.weekly) }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -uo pipefail
@@ -114,6 +120,15 @@ jobs:
           if [ "$TEST_TEXT" = true ]; then
             status="fresh, last run $last_words"; [ "$stale" = 1 ] && status="STALE"
             text "TEST from ops-watchdog (GitHub Actions): this is only a test. ops-watch is $status. Real alerts will look like this." || failed=1
+          fi
+
+          # Weekly proof the whole path works. When stale, the stale alert above already texted.
+          if [ "$WEEKLY" = true ]; then
+            if [ "$stale" = 0 ]; then
+              text "Weekly check: ops-watchdog is running and ops-watch last ran $(( (now - last_s) / 60 )) min ago. No action needed." || failed=1
+            else
+              echo "Weekly text skipped: heartbeat is stale, the stale alert covers it."
+            fi
           fi
 
           # Keepalive: GitHub turns off scheduled workflows after 60 days without repo activity.

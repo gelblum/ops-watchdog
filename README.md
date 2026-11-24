@@ -12,7 +12,10 @@ Every 5 minutes, `.github/workflows/watchdog.yml`:
 3. Texts through Twilio: once when it goes stale, a reminder at most once an hour while it stays
    stale, and once when it is back. The state between runs (timestamps only) lives in the Actions
    cache.
-4. Once a day, re-enables itself through the API so GitHub's 60-day inactivity rule never turns the
+4. Every Monday 9 AM ET (14:00 UTC, so 10 AM during daylight time), texts "Weekly check: ...
+   No action needed." to prove the whole path still works. Skipped if the heartbeat is stale, since
+   the stale alert already texted.
+5. Once a day, re-enables itself through the API so GitHub's 60-day inactivity rule never turns the
    schedule off.
 
 If a text can't be sent, the run fails, so GitHub's own failed-run email is the backup.
